@@ -88,7 +88,7 @@ unsigned long commSlotStartMs = 0;
 
 
 // ================== RTC & LCD ==================
-DS3231 rtc(SDA, SCL);
+DS3231 rtc;
 LiquidCrystal_I2C lcd(0x27, 20, 4);  // LCD 20x4
 
 
@@ -347,7 +347,7 @@ void setup() {
 
   // RTC + LCD
   Wire.begin();
-  rtc.begin();
+  // RTC siap pakai via RTClib::now()
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
@@ -1342,24 +1342,11 @@ void updateLCD() {
 
 // ================== RTC READ ==================
 void bacaRTC() {
-  String t = rtc.getTimeStr();
-  if (t.length() >= 8) {
-    jam = t.substring(0, 2);
-    menit = t.substring(3, 5);
-    detik = t.substring(6, 8);
-  } else {
-    jam = "00";
-    menit = "00";
-    detik = "00";
-  }
-
-
-  String d = rtc.getDateStr();  // Format: DD.MM.YYYY
-  if (d.length() >= 2) {
-    tanggal = d.substring(0, 2);
-  } else {
-    tanggal = "01";
-  }
+  DateTime n = RTClib::now(Wire);
+  jam = (n.hour() < 10) ? "0" + String(n.hour()) : String(n.hour());
+  menit = (n.minute() < 10) ? "0" + String(n.minute()) : String(n.minute());
+  detik = (n.second() < 10) ? "0" + String(n.second()) : String(n.second());
+  tanggal = (n.day() < 10) ? "0" + String(n.day()) : String(n.day());
 }
 
 
