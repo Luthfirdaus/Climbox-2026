@@ -1,8 +1,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-#define WIFI_SSID "infinix"
-#define WIFI_PASSWORD "1234655"
+#define WIFI_SSID "Climbox2026"
+#define WIFI_PASSWORD "menujupangandaran"
 
 // GANTI DENGAN URL WEB APP GOOGLE APPS SCRIPT
 const String GOOGLE_SCRIPT_URL = "PASTE_URL_DISINI";
