@@ -1,0 +1,77 @@
+function doGet(e) {
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  var zonaWaktu = Session.getScriptTimeZone();
+  var tglHariIni = Utilities.formatDate(new Date(), zonaWaktu, "dd-MM-yyyy");
+
+  var sheet = ss.getSheetByName(tglHariIni);
+
+  if (!sheet) {
+
+    sheet = ss.insertSheet(tglHariIni);
+
+    sheet.appendRow([
+      "Waktu",
+      "Arah Angin",
+      "Kecepatan Angin (m/s)",
+      "Curah Hujan (mm)",
+      "TSS (mg/L)",
+      "TDS (ppm)",
+      "Suhu Air (°C)",
+      "Suhu Udara (°C)",
+      "Kelembapan Udara (%)",
+      "pH",
+      "DO (mg/L)",
+      "EC (uS/cm)",
+      "Pump Laut",
+      "Pump Bilas",
+      "Latitude",
+      "Longitude",
+      "Device"
+    ]);
+
+  }
+
+  var waktu = Utilities.formatDate(new Date(), zonaWaktu, "HH:mm:ss");
+
+  sheet.appendRow([
+
+    waktu,
+
+    e.parameter.wind_direction_str,
+    parseFloat(e.parameter.wind_speed_str),
+
+    parseFloat(e.parameter.rainfall_str),
+
+    parseFloat(e.parameter.tss_str),
+
+    parseFloat(e.parameter.tds_str),
+
+    parseFloat(e.parameter.water_temp_str),
+
+    parseFloat(e.parameter.air_temp_str),
+
+    parseFloat(e.parameter.air_hum_str),
+
+    parseFloat(e.parameter.ph_str),
+
+    parseFloat(e.parameter.do_str),
+
+    parseFloat(e.parameter.ec_str),
+
+    e.parameter.pump_laut,
+
+    e.parameter.pump_bilas,
+
+    e.parameter.lat_str,
+
+    e.parameter.lon_str,
+
+    e.parameter.device
+
+  ]);
+
+  return ContentService.createTextOutput("OK");
+
+}

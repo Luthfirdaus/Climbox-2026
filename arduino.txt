@@ -1,0 +1,1707 @@
+/**************************************************************
+ *  Weather Station + Pump Scheduler dengan Setting Tombol Fisik
+ *  - 5 tombol (Mode, OK, Cancel, Up, Down) untuk setting
+ *  - LCD 20x4 I2C (manual slide via tombol)
+ *  - Kontrol pompa full dari EEPROM (durasi, repeat, waktu)
+ *  - Repeat hari via modulo tanggal RTC
+ *  - Sensor logging to SD per menit
+ *  - Send data to ESP32
+ **************************************************************/
+
+
+
+// ================== Libraries ==================
+#include <SD.h>
+#include <SPI.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <DS3231.h>
+#include <LiquidCrystal_I2C.h>
+#include <TinyGPS++.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "DFRobot_PH.h"
+#include <EEPROM.h>
+#include <ModbusMaster.h>
+
+
+
+// ================== Debug ==================
+const bool GPS_DEBUG = false;
+bool debugpar = false;
+const bool DEBUG_PH = debugpar;
+const bool DEBUG_TSS = debugpar;
+const bool DEBUG_TDS = debugpar;
+const bool DEBUG_DO = debugpar;
+
+
+
+// ================== PIN BUTTON SETTING ==================
+const int btnMode = 33;    // Tombol Mode (kuning)
+const int btnOK = 34;      // Tombol OK (ijo)
+const int btnCancel = 35;  // Tombol Cancel (merah)
+const int btnUp = 36;      // Tombol Up (biru) - NEXT SLIDE
+const int btnDown = 37;    // Tombol Down (putih) - PREV SLIDE
+
+
+
+// ================== MODE SISTEM ==================
+enum Mode { MODE_DISPLAY,
+            SETTING };
+Mode currentMode = MODE_DISPLAY;
+
+
+
+// ================== SETTING VARIABLES ==================
+int settingIndex = 0;
+bool isEditing = false;
+int editingField = 0;
+bool blinkState = false;
+unsigned long lastBlinkUpdate = 0;
+bool needsRedraw = true;
+
+
+
+// ================== MAPPING INDEX SETTING ==================
+const int IDX_POMPA_LAUT = 0;
+const int IDX_POMPA_BILAS = 1;
+const int TOTAL_SETTINGS = 2;
+
+
+
+// ================== STRUKTUR DATA SETTING ==================
+// Untuk Pompa: [0]=durasi_min, [1]=durasi_sec, [2]=repeat_hari, [3]=repeat_jam, [4]=waktu_jam, [5]=waktu_min
+struct Setting {
+  int data[6];
+};
+Setting settings[2];  // 0=Pompa Laut, 1=Pompa Bilas
+
+
+
+// ================== COMM slot ==================
+enum class CommSlot : uint8_t { WIND,
+                                RS485 };
+CommSlot commSlot = CommSlot::WIND;
+const unsigned long SLOT_COMM_MS = 5000;
+unsigned long commSlotStartMs = 0;
+
+
+
+// ================== RTC & LCD ==================
+DS3231 rtc(SDA, SCL);
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // LCD 20x4
+
+
+
+// ================== Rain Gauge ==================
+const int pin_interrupt = 18;
+volatile long int jumlah_tip = 0;
+float curah_hujan = 0.00;
+float milimeter_per_tip = 0.70;
+volatile boolean flag = false;
+
+
+
+// ================== Interval Waktu ==================
+unsigned long previousMillis = 0;
+const long interval = 1000;
+
+
+
+// ================== Serial Ports ==================
+SoftwareSerial mySerial(32, 30);
+SoftwareSerial windSerial(13, 12);
+SoftwareSerial rs485Serial(10, 9);
+
+
+
+// ================== Wind Dir ==================
+int a, b;
+String data, arah_angin = "0", s_angin = "0", arah_singkat = "--";
+
+
+
+// ================== GPS ==================
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+bool gpsEverFixed = false;
+double gpsLat = 0.0, gpsLng = 0.0;
+
+
+
+// ================== Anemometer ==================
+int GPIO_pulse = 3;
+volatile unsigned long pulseCount = 0;
+volatile unsigned long lastPulseMicros = 0;
+const unsigned long debounceMicros = 5000;
+unsigned long lastSpeedSampleMs = 0;
+const unsigned long speedSampleIntervalMs = 200;
+unsigned long prevPulseCount = 0;
+float speed_instant_kmh = 0.0f;
+const float PULSES_PER_ROT = 1.0f;
+
+
+
+// ================== RTC strings ==================
+String jam, menit, detik, tanggal;
+String previousMenit = "";
+
+
+
+// ================== Avg per menit ==================
+float kecepatan_total = 0;
+int count_speed = 0;
+float avgSpeedForDisplay = 0;
+
+
+
+// ================== LCD slide control (MANUAL) ==================
+unsigned long prevLcdMillis = 0;
+const unsigned long lcdMinInterval = 100;
+bool lcdForce = false;
+uint8_t currentSlide = 0;  // 0..5
+uint8_t prevSlide = 255;
+
+
+
+// ================== Sensor pins ==================
+#define TURB_PIN A0
+#define TDS_PIN A1
+#define PRESS_PIN A2
+#define ONE_WIRE_PIN 2
+#define PH_PIN A4
+#define DO_PIN PRESS_PIN
+
+
+
+OneWire ds(ONE_WIRE_PIN);
+DallasTemperature ds18(&ds);
+
+
+
+// ================== TSS/NTU calibration ==================
+const float VREF_ADC = 4.94f;
+const int TSS_SAMPLES = 50;
+float V_NTU0 = 3.80;
+float V_NTU1000 = 3.00;
+float V_NTU3000 = 2.60;
+
+
+
+// ================== DO mg/L ==================
+#define ADC_COUNTS 1023.0
+#define VREF_MV 5000.0
+const float DO_VZERO_mV = 35.0f;
+const float DO_VAIR_mV = 1145.0f;
+float g_do_mgL = NAN;
+float g_do_mV = NAN;
+
+
+
+// ================== TDS calibrated ==================
+const float VREF_TDS_MEAS = 4.914f;
+const float TDS_FACTOR = 0.5f;
+const float CAL_FACTOR = 1.1002f;
+#define TDS_SCOUNT 30
+int tdsBuf[TDS_SCOUNT], tdsBufTmp[TDS_SCOUNT];
+int tdsIdx = 0;
+
+
+
+// ================== RS485 (CWT-TH) ==================
+ModbusMaster rs485;
+float g_airTempC = NAN;
+float g_airRH = NAN;
+unsigned long lastTHReadMs = 0;
+const unsigned long TH_READ_INTERVAL = 500;
+
+
+
+// ================== Global sensor cache ==================
+float g_tempC = NAN;
+float g_vTurb = NAN;
+float g_tss_NTU = NAN;
+float g_tdsPPM = NAN;
+float g_tdsAvgVolt = NAN;
+float g_pH = NAN;
+float g_ec_mScm = NAN;
+
+
+
+// ================== PUMPS (Relay Active LOW) ==================
+#define POMPA_AIR_LAUT_PIN 39
+#define POMPA_AIR_BILAS_PIN 41
+
+
+
+bool pompaLautOn = false;
+bool pompaBilasOn = false;
+unsigned long pompaLautStartMs = 0;
+unsigned long pompaBilasStartMs = 0;
+
+
+
+bool overrideLaut = false;
+bool overrideBilas = false;
+
+
+
+// ================== SD Card ==================
+const int chipSelect = 53;
+File dataFile;
+bool sdOk = false;
+unsigned long lastSdAttemptMs = 0;
+const unsigned long sdRetryIntervalMs = 5000;
+const int SD_CARD_DETECT_PIN = -1;
+
+
+
+// ================== pH instance ==================
+DFRobot_PH ph;
+
+
+
+// ================== Prototypes ==================
+void hitung_curah_hujan();
+void rpm_anemometer();
+void updateLCD();
+void sampleKecepatanInstan();
+void bacaRTC();
+void kontrolPompaTerjadwal();
+void prosesPerintahSerialPompa();
+void nyalakanPompaLaut();
+void matikanPompaLaut();
+void nyalakanPompaBilas();
+void matikanPompaBilas();
+void cekStatusPompa();
+void processGPS();
+bool tryInitSD(bool createIfMissing);
+bool sdAppendLine(const String &line);
+inline void serviceGPSQuick();
+void readTH_RS485();
+inline void flushWind();
+inline void flushRS485();
+void switchCommSlot(CommSlot next);
+float readVoltageAvg(byte pin, int samples = 20);
+float readDS18x20C();
+int medianFilter(int *src, int n);
+float DOsaturationAtTemp(float tC);
+void debugPH(float phAdc, float vPH_mV, float tempC, float pHval);
+void debugTSS(float volt, float ntu);
+void debugTDS(int med, float vAvg, float vComp, float tdsRaw, float ppm);
+void debugDO(uint16_t raw, float mV, float tempC, float sat, float mgL);
+
+
+
+// ================== Setting mode prototypes ==================
+bool readButton(int pin);
+void handleSettingMode();
+void displaySetting(int index);
+void displayWithBlink(int index, int field, bool state);
+void handleValueChange(int index, int field, bool increment);
+int getMaxField(int index);
+void saveSetting(int index);
+String getSettingString(int index);
+void loadSettingsFromEEPROM();
+
+
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(9600);
+
+
+
+  // Button pins
+  pinMode(btnMode, INPUT_PULLUP);
+  pinMode(btnOK, INPUT_PULLUP);
+  pinMode(btnCancel, INPUT_PULLUP);
+  pinMode(btnUp, INPUT_PULLUP);
+  pinMode(btnDown, INPUT_PULLUP);
+
+
+  Serial.println("Testing buttons...");
+  Serial.print("btnMode (33): ");
+  Serial.println(digitalRead(btnMode));
+  Serial.print("btnOK (34): ");
+  Serial.println(digitalRead(btnOK));
+  Serial.print("btnCancel (35): ");
+  Serial.println(digitalRead(btnCancel));
+  Serial.print("btnUp (36): ");
+  Serial.println(digitalRead(btnUp));
+  Serial.print("btnDown (37): ");
+  Serial.println(digitalRead(btnDown));
+  // Load settings dari EEPROM
+  loadSettingsFromEEPROM();
+
+
+
+  // SD
+  Serial.println("Initializing SD card...");
+  if (SD_CARD_DETECT_PIN != -1) {
+    pinMode(SD_CARD_DETECT_PIN, INPUT_PULLUP);
+  }
+  tryInitSD(true);
+
+
+
+  // RTC + LCD
+  Wire.begin();
+  rtc.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Weather Station");
+  lcd.setCursor(0, 1);
+  lcd.print("Init...");
+
+
+
+  // Rain gauge ISR
+  pinMode(pin_interrupt, INPUT);
+  attachInterrupt(digitalPinToInterrupt(pin_interrupt), hitung_curah_hujan, FALLING);
+
+
+
+  // Serial
+  windSerial.begin(9600);
+  windSerial.setTimeout(20);
+  mySerial.begin(9600);
+
+
+
+  // RS485
+  rs485Serial.begin(4800);
+  rs485.begin(1, rs485Serial);
+  rs485Serial.listen();
+
+
+
+  // GPS
+  Serial2.begin(GPSBaud);
+  Serial.println(F("GPS on Serial2"));
+
+
+
+  commSlotStartMs = millis();
+  switchCommSlot(CommSlot::WIND);
+
+
+
+  // Anemometer ISR
+  pinMode(GPIO_pulse, INPUT_PULLUP);
+  detachInterrupt(digitalPinToInterrupt(GPIO_pulse));
+  attachInterrupt(digitalPinToInterrupt(GPIO_pulse), rpm_anemometer, RISING);
+
+
+
+  // DS18B20
+  ds18.begin();
+
+
+
+  // pH
+  ph.begin();
+
+
+
+  // Pumps
+  pinMode(POMPA_AIR_LAUT_PIN, OUTPUT);
+  pinMode(POMPA_AIR_BILAS_PIN, OUTPUT);
+  digitalWrite(POMPA_AIR_LAUT_PIN, HIGH);   // OFF
+  digitalWrite(POMPA_AIR_BILAS_PIN, HIGH);  // OFF
+
+
+
+  delay(400);
+  lcd.clear();
+  updateLCD();
+}
+
+
+
+// ================== MODE BUTTON DEBOUNCE ==================
+unsigned long lastModeButtonPress = 0;
+const unsigned long MODE_BUTTON_DEBOUNCE = 1000; // 1 detik cooldown
+
+
+
+// ================== RESET FUNCTION ==================
+void resetBackgroundProcesses() {
+  // Reset comm slot
+  commSlotStartMs = millis();
+ 
+  // Reset LCD
+  lcdForce = true;
+  needsRedraw = true;
+ 
+  // Reset editing state
+  isEditing = false;
+  editingField = 0;
+  blinkState = false;
+ 
+  Serial.println("Background processes reset");
+}
+
+
+
+// ================== MAIN LOOP (REVISED) ==================
+void loop() {
+  unsigned long currentMillis = millis();
+
+
+  // ========================================================
+  // PRIORITAS TERTINGGI: CEK TOMBOL MODE (KUNING) DULU
+  // ========================================================
+  if (readButton(btnMode)) {
+    // Cek apakah sudah lewat debounce time (1 detik)
+    if (currentMillis - lastModeButtonPress >= MODE_BUTTON_DEBOUNCE) {
+      lastModeButtonPress = currentMillis;
+     
+      // Toggle mode
+      if (currentMode == MODE_DISPLAY) {
+        currentMode = SETTING;
+        settingIndex = 0;
+        Serial.println(">>> MASUK MODE SETTING <<<");
+      } else {
+        currentMode = MODE_DISPLAY;
+        Serial.println(">>> KEMBALI KE MODE DISPLAY <<<");
+      }
+     
+      // Reset semua proses background
+      resetBackgroundProcesses();
+     
+      // Update LCD
+      if (currentMode == MODE_DISPLAY) {
+        updateLCD();
+      } else {
+        displaySetting(settingIndex);
+      }
+     
+      // Jangan proses apapun lagi di loop ini
+      return;
+    } else {
+      // Belum 1 detik sejak tekan terakhir
+      Serial.println("Tombol Mode masih cooldown...");
+      delay(100);
+      return;
+    }
+  }
+
+
+  // === MODE DISPLAY: Monitor sensor & control ===
+  if (currentMode == MODE_DISPLAY) {
+
+
+    // Toggle COMM slot
+    if (millis() - commSlotStartMs >= SLOT_COMM_MS) {
+      switchCommSlot(commSlot == CommSlot::WIND ? CommSlot::RS485 : CommSlot::WIND);
+    }
+
+
+    bool windDirChanged = false;
+
+
+    // SD auto-retry
+    if (!sdOk) {
+      bool canTry = true;
+      if (SD_CARD_DETECT_PIN != -1) {
+        canTry = (digitalRead(SD_CARD_DETECT_PIN) == LOW);
+      }
+      if (canTry && (millis() - lastSdAttemptMs >= sdRetryIntervalMs)) {
+        lastSdAttemptMs = millis();
+        tryInitSD(true);
+      }
+    }
+
+
+    // Baca arah angin (windSerial)
+    if (commSlot == CommSlot::WIND) {
+      windSerial.listen();
+      if (windSerial.available()) {
+        data = windSerial.readString();
+        a = data.indexOf("*");
+        b = data.indexOf("#");
+        if (a >= 0 && b > a) {
+          s_angin = data.substring(a + 1, b);
+          String oldShort = arah_singkat;
+          if (s_angin == "1") {
+            arah_angin = "utara";
+            arah_singkat = "U";
+          } else if (s_angin == "2") {
+            arah_angin = "timur laut";
+            arah_singkat = "TL";
+          } else if (s_angin == "3") {
+            arah_angin = "timur";
+            arah_singkat = "T";
+          } else if (s_angin == "4") {
+            arah_angin = "tenggara";
+            arah_singkat = "TG";
+          } else if (s_angin == "5") {
+            arah_angin = "selatan";
+            arah_singkat = "S";
+          } else if (s_angin == "6") {
+            arah_angin = "barat daya";
+            arah_singkat = "BD";
+          } else if (s_angin == "7") {
+            arah_angin = "barat";
+            arah_singkat = "B";
+          } else if (s_angin == "8") {
+            arah_angin = "barat laut";
+            arah_singkat = "BL";
+          } else {
+            arah_angin = "unknown";
+            arah_singkat = "--";
+          }
+          if (arah_singkat != oldShort) windDirChanged = true;
+        }
+      }
+    }
+
+
+    // Baca TH via RS485
+    if (commSlot == CommSlot::RS485) {
+      rs485Serial.listen();
+      readTH_RS485();
+    }
+
+
+    // GPS feed
+    processGPS();
+
+
+    // Sample sensor
+    sampleKecepatanInstan();
+
+
+    // Suhu air
+    float tempC_new = readDS18x20C();
+
+
+    // TSS
+    float vTurb_new = readVoltageAvg(TURB_PIN);
+    float vTurb_V = vTurb_new;
+    float tssNTU;
+    if (vTurb_V >= V_NTU0) tssNTU = 0.0;
+    else if (vTurb_V <= V_NTU3000) tssNTU = 3000.0;
+    else if (vTurb_V > V_NTU1000) {
+      tssNTU = ((V_NTU0 - vTurb_V) / (V_NTU0 - V_NTU1000)) * 1000.0;
+    } else {
+      tssNTU = 1000.0 + ((V_NTU1000 - vTurb_V) / (V_NTU1000 - V_NTU3000)) * 2000.0;
+    }
+    g_tss_NTU = tssNTU;
+    g_vTurb = vTurb_V;
+    debugTSS(vTurb_V, tssNTU);
+
+
+    // TDS
+    static unsigned long tdsSampleMs = millis();
+    if (millis() - tdsSampleMs > 40) {
+      tdsSampleMs = millis();
+      tdsBuf[tdsIdx] = analogRead(TDS_PIN);
+      tdsIdx = (tdsIdx + 1) % TDS_SCOUNT;
+    }
+    static unsigned long tdsCalcMs = millis();
+    if (millis() - tdsCalcMs > 800) {
+      tdsCalcMs = millis();
+      int med = medianFilter(tdsBuf, TDS_SCOUNT);
+      float vAvg = med * (VREF_TDS_MEAS / 1023.0f);
+      float tempUsedC = (g_tempC <= -999) ? 25.0f : g_tempC;
+      float comp = 1.0f + 0.02f * (tempUsedC - 25.0f);
+      float vComp = vAvg / comp;
+      float tdsRaw = (133.42f * vComp * vComp * vComp - 255.86f * vComp * vComp + 857.39f * vComp) * TDS_FACTOR;
+      g_tdsPPM = tdsRaw * CAL_FACTOR;
+      // EC derived from TDS: EC (mS/cm) = TDS (ppm) / 500
+      g_ec_mScm = g_tdsPPM / 500.0f;
+      g_tdsAvgVolt = vAvg;
+      debugTDS(med, vAvg, vComp, tdsRaw, g_tdsPPM);
+    }
+
+
+    // pH
+    long phSum = 0;
+    const int PH_N = 10;
+    for (int i = 0; i < PH_N; i++) {
+      phSum += analogRead(PH_PIN);
+      delay(2);
+    }
+    float phAdc = phSum / (float)PH_N;
+    float vPH_mV = (phAdc / 1023.0f) * 5000.0f;
+
+
+    if (isnan(g_tempC) || fabs(g_tempC - tempC_new) > 0.2f) {
+      g_tempC = tempC_new;
+    }
+    float tempUsedC = (g_tempC <= -999) ? 25.0f : g_tempC;
+
+
+    float pH_new = ph.readPH(vPH_mV, tempUsedC);
+    g_pH = pH_new;
+    debugPH(phAdc, vPH_mV, tempUsedC, pH_new);
+
+
+    // DO
+    long doSum = 0;
+    const int DO_N = 20;
+    for (int i = 0; i < DO_N; i++) {
+      doSum += analogRead(DO_PIN);
+      delay(2);
+    }
+    uint16_t doRaw = doSum / DO_N;
+    float do_mV = doRaw * (VREF_MV / ADC_COUNTS);
+    g_do_mV = do_mV;
+    float doSat = DOsaturationAtTemp(tempUsedC);
+    float frac = (do_mV - DO_VZERO_mV) / (DO_VAIR_mV - DO_VZERO_mV);
+    if (frac < 0) frac = 0;
+    if (frac > 1.2f) frac = 1.2f;
+    g_do_mgL = frac * doSat;
+    debugDO(doRaw, do_mV, tempUsedC, doSat, g_do_mgL);
+
+
+    // Tombol untuk ganti slide MANUAL (Up/Down aja, Mode sudah di handle di atas)
+    if (readButton(btnUp)) {
+      currentSlide = (currentSlide + 1) % 6;
+      lcdForce = true;
+      delay(200);
+    } else if (readButton(btnDown)) {
+      currentSlide = (currentSlide - 1 + 6) % 6;
+      lcdForce = true;
+      delay(200);
+    }
+
+
+    // Per detik
+    if (currentMillis - previousMillis >= interval) {
+      previousMillis = currentMillis;
+      bacaRTC();
+
+
+      prosesPerintahSerialPompa();
+      kontrolPompaTerjadwal();  // Kontrol pompa dari EEPROM
+
+
+      if (menit != previousMenit) {
+        float kecepatan_rata_rata = (count_speed > 0) ? (kecepatan_total / count_speed) : 0.0f;
+        curah_hujan = jumlah_tip * milimeter_per_tip;
+
+
+        // SD write
+        String latStr = gpsEverFixed ? String(gpsLat, 6) : "searching";
+        String lngStr = gpsEverFixed ? String(gpsLng, 6) : "searching";
+
+
+        bool canMeasure = pompaLautOn;
+        String tssField = canMeasure ? (String(g_tss_NTU, 1) + " NTU") : "tidak mengukur";
+        String tdsField = canMeasure ? (String(g_tdsPPM, 0) + " ppm") : "tidak mengukur";
+        String wtempField = canMeasure ? (String(g_tempC, 2) + " C") : "tidak mengukur";
+        String phField = canMeasure ? (String(g_pH, 2)) : "tidak mengukur";
+        String doField = canMeasure ? (String(g_do_mgL, 2) + " mg/L") : "tidak mengukur";
+        String ecField = canMeasure ? (String(g_ec_mScm, 2) + " ms/cm") : "tidak mengukur";
+
+
+        String line = String("timestamp: ") + jam + ":" + menit + ":" + detik
+                      + " | wind_direction: " + arah_angin
+                      + " | wind_speed: " + String(kecepatan_rata_rata, 2) + " km/h"
+                      + " | rainfall: " + String(curah_hujan, 2) + " mm"
+                      + " | TSS: " + tssField
+                      + " | TDS: " + tdsField
+                      + " | water temp: " + wtempField
+                      + " | pH: " + phField
+                      + " | DO: " + doField
+                      + " | EC: " + ecField
+                      + " | air temp: " + (isnan(g_airTempC) ? String("0") : String(g_airTempC, 1)) + " C"
+                      + " | air humidity: " + (isnan(g_airRH) ? String("0") : String(g_airRH, 1)) + " %"
+                      + " | pompaAirLaut: " + (pompaLautOn ? "ON" : "OFF")
+                      + " | pompaBilas: " + (pompaBilasOn ? "ON" : "OFF")
+                      + " | Latitude: " + latStr
+                      + " | Longitude: " + lngStr;
+
+
+        if (sdAppendLine(line)) {
+          Serial.println("Data written to DataLog.txt");
+        } else {
+          Serial.println("SD not ready");
+        }
+
+
+        // Kirim ke ESP32
+        bool canMeasure2 = pompaLautOn;
+        String tssSend = canMeasure2 ? String(g_tss_NTU, 1) : "tidak mengukur";
+        String tdsSend = canMeasure2 ? String(g_tdsPPM, 0) : "tidak mengukur";
+        String wtempSend = canMeasure2 ? String(g_tempC, 2) : "tidak mengukur";
+        String phSend = canMeasure2 ? String(g_pH, 2) : "tidak mengukur";
+        String doSend = canMeasure2 ? String(g_do_mgL, 2) : "tidak mengukur";
+        String ecSend = canMeasure2 ? String(g_ec_mScm, 2) : "tidak mengukur";
+
+
+        String dataToSend = String("wind_direction: ") + arah_angin
+                            + ", wind_speed: " + String(kecepatan_rata_rata, 2)
+                            + ", rainfall: " + String(curah_hujan, 2)
+                            + ", TSS: " + tssSend
+                            + ", TDS: " + tdsSend
+                            + ", water temp: " + wtempSend
+                            + ", pH: " + phSend
+                            + ", DO: " + doSend
+                            + ", EC: " + ecSend
+                            + ", pompaAirLaut: " + (pompaLautOn ? "ON" : "OFF")
+                            + ", pompaBilas: " + (pompaBilasOn ? "ON" : "OFF")
+                            + ", Latitude: " + latStr + ", Longitude: " + lngStr
+                            + ", air temp: " + (isnan(g_airTempC) ? String("0") : String(g_airTempC, 1))
+                            + ", air humidity: " + (isnan(g_airRH) ? String("0") : String(g_airRH, 1));
+
+
+        mySerial.println(dataToSend);
+        Serial.print("To ESP32 -> ");
+        Serial.println(dataToSend);
+
+
+        previousMenit = menit;
+        noInterrupts();
+        jumlah_tip = 0;
+        interrupts();
+        kecepatan_total = 0;
+        count_speed = 0;
+        avgSpeedForDisplay = 0.0f;
+        lcdForce = true;
+      }
+    }
+
+
+    // Event & refresh LCD
+    noInterrupts();
+    bool rgEvent = flag;
+    flag = false;
+    interrupts();
+
+
+    if (rgEvent || windDirChanged || lcdForce) {
+      if (millis() - prevLcdMillis >= lcdMinInterval) {
+        updateLCD();
+        lcdForce = false;
+      }
+    }
+
+
+    // Kalibrasi pH
+    {
+      long sum = 0;
+      const int N = 10;
+      for (int i = 0; i < N; i++) {
+        sum += analogRead(PH_PIN);
+        delay(2);
+      }
+      float adc = sum / (float)N;
+      float vPH_mV_now = (adc / 1023.0f) * 5000.0f;
+      ph.calibration(vPH_mV_now, tempUsedC);
+    }
+
+
+  }
+  // === MODE SETTING: Handle tombol setting ===
+  else if (currentMode == SETTING) {
+    handleSettingMode();
+  }
+
+
+  delay(50);
+}
+
+
+
+// ================== LOAD SETTINGS DARI EEPROM ==================
+void loadSettingsFromEEPROM() {
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 6; j++) {
+      int addr = (i * 6 + j) * 2;
+      settings[i].data[j] = EEPROM.read(addr) | (EEPROM.read(addr + 1) << 8);
+
+
+      // Validasi
+      if (settings[i].data[j] == -1 || settings[i].data[j] > 1000) {
+        settings[i].data[j] = 0;
+      }
+    }
+  }
+
+
+  // Set default untuk repeat interval
+  if (settings[IDX_POMPA_LAUT].data[2] == 0) settings[IDX_POMPA_LAUT].data[2] = 1;
+  if (settings[IDX_POMPA_BILAS].data[2] == 0) settings[IDX_POMPA_BILAS].data[2] = 1;
+
+
+  Serial.println("Settings loaded from EEPROM");
+}
+
+
+
+// ================== KONTROL POMPA TERJADWAL (DARI EEPROM) ==================
+void kontrolPompaTerjadwal() {
+  int m = menit.toInt();
+  int h = jam.toInt();
+  int d = tanggal.toInt();
+
+
+  // ==== POMPA LAUT ====
+  if (!overrideLaut) {
+    int repHari = settings[IDX_POMPA_LAUT].data[2];
+    int repJam = settings[IDX_POMPA_LAUT].data[3];
+    int waktuJam = settings[IDX_POMPA_LAUT].data[4];
+    int waktuMin = settings[IDX_POMPA_LAUT].data[5];
+    int durMin = settings[IDX_POMPA_LAUT].data[0];
+    int durSec = settings[IDX_POMPA_LAUT].data[1];
+    unsigned long durasi = (durMin * 60000UL) + (durSec * 1000UL);
+
+
+    bool shouldRun = false;
+
+
+    // Cek repeat hari (modulo tanggal)
+    if (d % repHari == 0) {
+      if (repJam > 0) {
+        // Nyala setiap X jam di menit waktuMin
+        if (h % repJam == 0 && m == waktuMin) {
+          shouldRun = true;
+        }
+      } else {
+        // Nyala 1x sehari di waktuJam:waktuMin
+        if (h == waktuJam && m == waktuMin) {
+          shouldRun = true;
+        }
+      }
+    }
+
+
+    if (shouldRun && !pompaLautOn) {
+      nyalakanPompaLaut();
+    }
+
+
+    // Matikan setelah durasi
+    if (pompaLautOn && (millis() - pompaLautStartMs >= durasi)) {
+      matikanPompaLaut();
+    }
+  }
+
+
+  // ==== POMPA BILAS ====
+  if (!overrideBilas) {
+    int repHari = settings[IDX_POMPA_BILAS].data[2];
+    int repJam = settings[IDX_POMPA_BILAS].data[3];
+    int waktuJam = settings[IDX_POMPA_BILAS].data[4];
+    int waktuMin = settings[IDX_POMPA_BILAS].data[5];
+    int durMin = settings[IDX_POMPA_BILAS].data[0];
+    int durSec = settings[IDX_POMPA_BILAS].data[1];
+    unsigned long durasi = (durMin * 60000UL) + (durSec * 1000UL);
+
+
+    bool shouldRun = false;
+
+
+    // Cek repeat hari (modulo tanggal)
+    if (d % repHari == 0) {
+      if (repJam > 0) {
+        // Nyala setiap X jam di menit waktuMin
+        if (h % repJam == 0 && m == waktuMin) {
+          shouldRun = true;
+        }
+      } else {
+        // Nyala 1x sehari di waktuJam:waktuMin
+        if (h == waktuJam && m == waktuMin) {
+          shouldRun = true;
+        }
+      }
+    }
+
+
+    if (shouldRun && !pompaBilasOn) {
+      nyalakanPompaBilas();
+    }
+
+
+    // Matikan setelah durasi
+    if (pompaBilasOn && (millis() - pompaBilasStartMs >= durasi)) {
+      matikanPompaBilas();
+    }
+  }
+}
+
+
+
+// ================== SETTING MODE HANDLER ==================
+bool readButton(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(50);
+    if (digitalRead(pin) == LOW) return true;
+  }
+  return false;
+}
+
+
+
+void handleSettingMode() {
+  static int lastSettingIndex = -1;
+
+
+  if (!isEditing) {
+    if (needsRedraw || settingIndex != lastSettingIndex) {
+      displaySetting(settingIndex);
+      lastSettingIndex = settingIndex;
+      needsRedraw = false;
+    }
+
+
+    if (readButton(btnUp)) {
+      settingIndex = (settingIndex + 1) % TOTAL_SETTINGS;
+      needsRedraw = true;
+      delay(200);
+    } else if (readButton(btnDown)) {
+      settingIndex = (settingIndex - 1 + TOTAL_SETTINGS) % TOTAL_SETTINGS;
+      needsRedraw = true;
+      delay(200);
+    } else if (readButton(btnOK)) {
+      isEditing = true;
+      editingField = 0;
+      blinkState = true;
+      lastBlinkUpdate = millis();
+      displaySetting(settingIndex);
+      Serial.println("Mulai edit setting: " + String(settingIndex));
+      delay(200);
+    }
+    // HAPUS TOMBOL MODE DARI SINI - sudah di handle di loop() utama
+   
+  } else {
+    // Mode editing - blink tiap 500ms
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastBlinkUpdate >= 500) {
+      lastBlinkUpdate = currentMillis;
+      blinkState = !blinkState;
+      displayWithBlink(settingIndex, editingField, blinkState);
+    }
+
+
+    if (readButton(btnOK)) {
+      int maxField = getMaxField(settingIndex);
+      if (editingField < maxField - 1) {
+        // Skip field 4 (waktu jam) kalau repJam > 0
+        if (editingField == 3 && (settingIndex == IDX_POMPA_LAUT || settingIndex == IDX_POMPA_BILAS)) {
+          int repJam = settings[settingIndex].data[3];
+          if (repJam > 0) {
+            editingField = 5;  // Skip ke field 5
+          } else {
+            editingField++;
+          }
+        } else {
+          editingField++;
+        }
+        blinkState = true;
+        displayWithBlink(settingIndex, editingField, blinkState);
+        delay(200);
+      } else {
+        saveSetting(settingIndex);
+        isEditing = false;
+        needsRedraw = true;
+        displaySetting(settingIndex);
+        Serial.println("Setting disimpan");
+        delay(200);
+      }
+    } else if (readButton(btnCancel)) {
+      isEditing = false;
+      needsRedraw = true;
+      displaySetting(settingIndex);
+      Serial.println("Edit dibatalkan");
+      delay(200);
+    } else if (readButton(btnUp)) {
+      handleValueChange(settingIndex, editingField, true);
+      blinkState = true;
+      displayWithBlink(settingIndex, editingField, blinkState);
+      lastBlinkUpdate = millis();
+      delay(150);
+    } else if (readButton(btnDown)) {
+      handleValueChange(settingIndex, editingField, false);
+      blinkState = true;
+      displayWithBlink(settingIndex, editingField, blinkState);
+      lastBlinkUpdate = millis();
+      delay(150);
+    }
+  }
+}
+
+
+
+void displaySetting(int index) {
+  lcd.clear();
+
+
+  if (index == IDX_POMPA_LAUT || index == IDX_POMPA_BILAS) {
+    String pompaNama = (index == IDX_POMPA_LAUT) ? "Pompa Laut" : "Pompa Bilas";
+    int durMin = settings[index].data[0];
+    int durSec = settings[index].data[1];
+    int repHari = settings[index].data[2];
+    int repJam = settings[index].data[3];
+    int waktuJam = settings[index].data[4];
+    int waktuMin = settings[index].data[5];
+
+
+    lcd.setCursor(0, 0);
+    lcd.print("Setting: " + pompaNama);
+    lcd.setCursor(0, 1);
+    lcd.print("Durasi: " + String(durMin) + "m " + String(durSec) + "s");
+    lcd.setCursor(0, 2);
+    lcd.print("Setiap: " + String(repHari) + "h, " + String(repJam) + "j");
+    lcd.setCursor(0, 3);
+    if (repJam > 0) {
+      lcd.print("Waktu: " + String(waktuMin) + "m");
+    } else {
+      String jamStr = (waktuJam < 10) ? "0" + String(waktuJam) : String(waktuJam);
+      String minStr = (waktuMin < 10) ? "0" + String(waktuMin) : String(waktuMin);
+      lcd.print("Waktu: " + jamStr + ":" + minStr);
+    }
+  }
+}
+
+
+
+void displayWithBlink(int index, int field, bool state) {
+  displaySetting(index);
+
+
+  if (!state) {
+    if (index == IDX_POMPA_LAUT || index == IDX_POMPA_BILAS) {
+      int repJam = settings[index].data[3];
+
+
+      switch (field) {
+        case 0:  // Durasi menit
+          lcd.setCursor(8, 1);
+          lcd.print("  ");
+          break;
+        case 1:  // Durasi detik
+          lcd.setCursor(12, 1);
+          lcd.print("  ");
+          break;
+        case 2:  // Repeat hari
+          lcd.setCursor(8, 2);
+          lcd.print("  ");
+          break;
+        case 3:  // Repeat jam
+          lcd.setCursor(13, 2);
+          lcd.print("  ");
+          break;
+        case 4:  // Waktu jam
+          if (repJam == 0) {
+            lcd.setCursor(7, 3);
+            lcd.print("  ");
+          }
+          break;
+        case 5:  // Waktu menit
+          if (repJam > 0) {
+            lcd.setCursor(7, 3);
+            lcd.print("  ");
+          } else {
+            lcd.setCursor(10, 3);
+            lcd.print("  ");
+          }
+          break;
+      }
+    }
+  }
+}
+
+
+
+void handleValueChange(int index, int field, bool increment) {
+  int delta = increment ? 1 : -1;
+
+
+  if (index == IDX_POMPA_LAUT || index == IDX_POMPA_BILAS) {
+    int repJam = settings[index].data[3];
+
+
+    switch (field) {
+      case 0:  // Durasi menit (0-59)
+        settings[index].data[0] += delta;
+        if (settings[index].data[0] > 59) settings[index].data[0] = 0;
+        if (settings[index].data[0] < 0) settings[index].data[0] = 59;
+        break;
+      case 1:  // Durasi detik (0-59)
+        settings[index].data[1] += delta;
+        if (settings[index].data[1] > 59) settings[index].data[1] = 0;
+        if (settings[index].data[1] < 0) settings[index].data[1] = 59;
+        break;
+      case 2:  // Repeat hari (1-30)
+        settings[index].data[2] += delta;
+        if (settings[index].data[2] > 30) settings[index].data[2] = 1;
+        if (settings[index].data[2] < 1) settings[index].data[2] = 30;
+        break;
+      case 3:  // Repeat jam (0-24)
+        settings[index].data[3] += delta;
+        if (settings[index].data[3] > 24) settings[index].data[3] = 0;
+        if (settings[index].data[3] < 0) settings[index].data[3] = 24;
+        break;
+      case 4:  // Waktu jam (0-23)
+        if (repJam == 0) {
+          settings[index].data[4] += delta;
+          if (settings[index].data[4] > 23) settings[index].data[4] = 0;
+          if (settings[index].data[4] < 0) settings[index].data[4] = 23;
+        }
+        break;
+      case 5:  // Waktu menit (0-59)
+        settings[index].data[5] += delta;
+        if (settings[index].data[5] > 59) settings[index].data[5] = 0;
+        if (settings[index].data[5] < 0) settings[index].data[5] = 59;
+        break;
+    }
+  }
+}
+
+
+
+int getMaxField(int index) {
+  if (index == IDX_POMPA_LAUT || index == IDX_POMPA_BILAS) {
+    return 6;  // Field 0-5
+  }
+  return 1;
+}
+
+
+
+void saveSetting(int index) {
+  for (int j = 0; j < 6; j++) {
+    int addr = (index * 6 + j) * 2;
+    int value = settings[index].data[j];
+    EEPROM.update(addr, value & 0xFF);
+    EEPROM.update(addr + 1, (value >> 8) & 0xFF);
+  }
+  Serial.println("Setting " + String(index) + " disimpan ke EEPROM");
+}
+
+
+
+String getSettingString(int index) {
+  if (index == IDX_POMPA_LAUT) return "Pompa Laut";
+  else if (index == IDX_POMPA_BILAS) return "Pompa Bilas";
+  return "";
+}
+
+
+
+// ================== LCD UPDATE (20x4) ==================
+void updateLCD() {
+  prevLcdMillis = millis();
+
+
+  if (currentSlide != prevSlide) {
+    lcd.clear();
+    prevSlide = currentSlide;
+  }
+
+
+
+  bool canMeasure = pompaLautOn;
+
+
+
+  if (currentSlide == 0) {
+    // Wind dir / speed / rain
+    noInterrupts();
+    long tips_copy = jumlah_tip;
+    interrupts();
+    float curah_live = tips_copy * milimeter_per_tip;
+
+
+
+    lcd.setCursor(0, 0);
+    lcd.print("WinDir:");
+    lcd.print(arah_singkat);
+    lcd.print(" SPD:");
+    lcd.print(avgSpeedForDisplay, 0);
+    lcd.setCursor(0, 1);
+    lcd.print("RAIN:");
+    lcd.print(curah_live, 2);
+    lcd.print("mm   ");
+    lcd.setCursor(0, 2);
+    lcd.print("                    ");  // clear
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+
+
+
+  } else if (currentSlide == 1) {
+    // Temp
+    lcd.setCursor(0, 0);
+    if (canMeasure) {
+      lcd.print("TEMP: ");
+      lcd.print(g_tempC);
+      lcd.print("C      ");
+    } else {
+      lcd.print("suhu tidak terukur  ");
+    }
+    lcd.setCursor(0, 1);
+    lcd.print("                    ");
+    lcd.setCursor(0, 2);
+    lcd.print("                    ");
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+
+
+
+  } else if (currentSlide == 2) {
+    // TSS / TDS
+    if (canMeasure) {
+      lcd.setCursor(0, 0);
+      lcd.print("TSS: ");
+      lcd.print(g_tss_NTU, 1);
+      lcd.print(" NTU     ");
+      lcd.setCursor(0, 1);
+      lcd.print("TDS: ");
+      lcd.print(g_tdsPPM, 0);
+      lcd.print(" ppm     ");
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print("TSS dan TDS         ");
+      lcd.setCursor(0, 1);
+      lcd.print("tidak mengukur      ");
+    }
+    lcd.setCursor(0, 2);
+    lcd.print("                    ");
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+
+
+
+  } else if (currentSlide == 3) {
+    // pH / DO
+    if (canMeasure) {
+      lcd.setCursor(0, 0);
+      lcd.print("pH : ");
+      lcd.print(g_pH, 2);
+      lcd.print("         ");
+      lcd.setCursor(0, 1);
+      lcd.print("DO : ");
+      lcd.print(g_do_mgL, 2);
+      lcd.print(" mg/L    ");
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print("PH dan DO           ");
+      lcd.setCursor(0, 1);
+      lcd.print("tidak mengukur      ");
+    }
+    lcd.setCursor(0, 2);
+    lcd.print("                    ");
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+
+
+
+  } else if (currentSlide == 4) {
+    // EC / Air Temp / Air Humidity
+    if (canMeasure) {
+      lcd.setCursor(0, 0);
+      lcd.print("EC: ");
+      lcd.print(g_ec_mScm, 2);
+      lcd.print(" ms/cm   ");
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print("EC tidak mengukur   ");
+    }
+    lcd.setCursor(0, 1);
+    lcd.print("AirT: ");
+    lcd.print(isnan(g_airTempC) ? "0" : String(g_airTempC, 1));
+    lcd.print("C         ");
+    lcd.setCursor(0, 2);
+    lcd.print("AirH: ");
+    lcd.print(isnan(g_airRH) ? "0" : String(g_airRH, 1));
+    lcd.print("%         ");
+    lcd.setCursor(0, 3);
+    lcd.print("                    ");
+
+
+
+  } else if (currentSlide == 5) {
+    // Status Pompa / GPS / RTC
+    lcd.setCursor(0, 0);
+    lcd.print("P.Laut: ");
+    lcd.print(pompaLautOn ? "ON " : "OFF");
+    lcd.print(" P.Bilas: ");
+    lcd.print(pompaBilasOn ? "ON " : "OFF");
+    lcd.setCursor(0, 1);
+    lcd.print("GPS: ");
+    if (gpsEverFixed) {
+      lcd.print(String(gpsLat, 4) + "," + String(gpsLng, 4));
+    } else {
+      lcd.print("searching...    ");
+    }
+    lcd.setCursor(0, 2);
+    lcd.print("RTC: " + jam + ":" + menit + ":" + detik + "      ");
+    lcd.setCursor(0, 3);
+    lcd.print("Tanggal: " + tanggal + "        ");
+  }
+}
+
+
+
+// ================== RTC READ ==================
+void bacaRTC() {
+  String t = rtc.getTimeStr();
+  if (t.length() >= 8) {
+    jam = t.substring(0, 2);
+    menit = t.substring(3, 5);
+    detik = t.substring(6, 8);
+  } else {
+    jam = "00";
+    menit = "00";
+    detik = "00";
+  }
+
+
+  String d = rtc.getDateStr();  // Format: DD.MM.YYYY
+  if (d.length() >= 2) {
+    tanggal = d.substring(0, 2);
+  } else {
+    tanggal = "01";
+  }
+}
+
+
+
+// ================== SD HELPERS ==================
+bool tryInitSD(bool createIfMissing) {
+  Serial.println("[SD] Trying init...");
+  pinMode(SS, OUTPUT);
+  SPI.begin();
+  if (SD.begin(chipSelect)) {
+    sdOk = true;
+    Serial.println("[SD] OK");
+    if (createIfMissing && !SD.exists("DataLog.txt")) {
+      File f = SD.open("DataLog.txt", FILE_WRITE);
+      if (f) {
+        f.println("# Weather log");
+        f.close();
+        Serial.println("[SD] Created DataLog.txt");
+      }
+    }
+    return true;
+  } else {
+    sdOk = false;
+    Serial.println("[SD] Init failed");
+    return false;
+  }
+}
+
+
+
+bool sdAppendLine(const String &line) {
+  if (!sdOk) return false;
+  File f = SD.open("DataLog.txt", FILE_WRITE);
+  if (!f) {
+    sdOk = false;
+    return false;
+  }
+  size_t n1 = f.println(line);
+  f.close();
+  if (n1 == 0) {
+    sdOk = false;
+    return false;
+  }
+  return true;
+}
+
+
+
+// ================== GPS ==================
+inline void serviceGPSQuick() {
+  while (Serial2.available() > 0) {
+    gps.encode((char)Serial2.read());
+  }
+}
+
+
+
+void processGPS() {
+  while (Serial2.available() > 0) {
+    char c = (char)Serial2.read();
+    gps.encode(c);
+  }
+  if (gps.location.isUpdated() && gps.location.isValid()) {
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
+    gpsEverFixed = true;
+  }
+}
+
+
+
+// ================== ANALOG HELPERS ==================
+float readVoltageAvg(byte pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    serviceGPSQuick();
+    delay(1);
+  }
+  return (sum / (float)samples) * VREF_ADC / 1023.0;
+}
+
+
+
+float readDS18x20C() {
+  ds18.requestTemperatures();
+  float t = ds18.getTempCByIndex(0);
+  if (t > -40 && t < 85) return t;
+  return -1000;
+}
+
+
+
+// ================== RS485 ==================
+void readTH_RS485() {
+  if (millis() - lastTHReadMs < TH_READ_INTERVAL) return;
+  lastTHReadMs = millis();
+
+
+
+  uint8_t res = rs485.readHoldingRegisters(0x0000, 2);
+  if (res == rs485.ku8MBSuccess) {
+    g_airRH = rs485.getResponseBuffer(0) / 10.0;
+    g_airTempC = (int16_t)rs485.getResponseBuffer(1) / 10.0;
+  }
+}
+
+
+
+// ================== COMM SLOT ==================
+inline void flushWind() {
+  while (windSerial.available()) windSerial.read();
+}
+inline void flushRS485() {
+  while (rs485Serial.available()) rs485Serial.read();
+}
+
+
+
+void switchCommSlot(CommSlot next) {
+  commSlot = next;
+  commSlotStartMs = millis();
+
+
+
+  if (commSlot == CommSlot::WIND) {
+    windSerial.listen();
+    flushRS485();
+  } else {
+    rs485Serial.listen();
+    flushWind();
+  }
+}
+
+
+
+// ================== ISR ==================
+void hitung_curah_hujan() {
+  flag = true;
+  jumlah_tip++;
+}
+
+
+
+void rpm_anemometer() {
+  unsigned long now = micros();
+  if ((long)(now - lastPulseMicros) >= (long)debounceMicros) {
+    pulseCount++;
+    lastPulseMicros = now;
+  }
+}
+
+
+
+void sampleKecepatanInstan() {
+  if (millis() - lastSpeedSampleMs < speedSampleIntervalMs) return;
+  unsigned long nowMs = millis();
+  unsigned long dtMs = nowMs - lastSpeedSampleMs;
+  lastSpeedSampleMs = nowMs;
+
+
+
+  noInterrupts();
+  unsigned long pulsesNow = pulseCount;
+  interrupts();
+
+
+
+  unsigned long dPulses = pulsesNow - prevPulseCount;
+  prevPulseCount = pulsesNow;
+
+
+
+  float dt = dtMs / 1000.0f;
+  float rps = (PULSES_PER_ROT > 0) ? (dPulses / (dt * PULSES_PER_ROT)) : 0.0f;
+
+
+
+  float v_ms = (-0.0181f * rps * rps) + (1.3859f * rps) + 1.4055f;
+  if (v_ms <= 1.5f) v_ms = 0.0f;
+  speed_instant_kmh = v_ms * 3.6f;
+
+
+
+  kecepatan_total += speed_instant_kmh;
+  count_speed++;
+}
+
+
+
+// ================== PUMP CONTROL ==================
+void prosesPerintahSerialPompa() {
+  if (!Serial.available()) return;
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+
+
+
+  if (input == "cek") {
+    cekStatusPompa();
+    return;
+  }
+
+
+
+  if (input == "ON1") {
+    overrideLaut = true;
+    nyalakanPompaLaut();
+    Serial.println("Pompa Air Laut Nyala (manual override ON)");
+  } else if (input == "OFF1") {
+    matikanPompaLaut();
+    overrideLaut = false;
+    Serial.println("Pompa Air Laut Mati (manual override OFF)");
+  } else if (input == "ON2") {
+    overrideBilas = true;
+    nyalakanPompaBilas();
+    Serial.println("Pompa Bilas Nyala (manual override ON)");
+  } else if (input == "OFF2") {
+    matikanPompaBilas();
+    overrideBilas = false;
+    Serial.println("Pompa Bilas Mati (manual override OFF)");
+  }
+}
+
+
+
+void nyalakanPompaLaut() {
+  digitalWrite(POMPA_AIR_LAUT_PIN, LOW);
+  pompaLautOn = true;
+  pompaLautStartMs = millis();
+}
+void matikanPompaLaut() {
+  digitalWrite(POMPA_AIR_LAUT_PIN, HIGH);
+  pompaLautOn = false;
+}
+void nyalakanPompaBilas() {
+  digitalWrite(POMPA_AIR_BILAS_PIN, LOW);
+  pompaBilasOn = true;
+  pompaBilasStartMs = millis();
+}
+void matikanPompaBilas() {
+  digitalWrite(POMPA_AIR_BILAS_PIN, HIGH);
+  pompaBilasOn = false;
+}
+
+
+
+void cekStatusPompa() {
+  Serial.println("Status Pompa:");
+  Serial.print("Pompa Air Laut: ");
+  Serial.println(pompaLautOn ? "Nyala" : "Mati");
+  Serial.print("Pompa Bilas   : ");
+  Serial.println(pompaBilasOn ? "Nyala" : "Mati");
+  Serial.print("Jam: ");
+  Serial.print(jam);
+  Serial.print(":");
+  Serial.println(menit);
+}
+
+
+
+// ================== DEBUG FUNCTIONS ==================
+void debugPH(float phAdc, float vPH_mV, float tempC, float pHval) {
+  if (!DEBUG_PH) return;
+  Serial.println(F("[PH-DBG] --------------"));
+  Serial.print(F("ADC: "));
+  Serial.print(phAdc, 1);
+  Serial.print(F(" mV: "));
+  Serial.print(vPH_mV, 0);
+  Serial.print(F(" T: "));
+  Serial.print(tempC, 2);
+  Serial.print(F(" pH: "));
+  Serial.println(pHval, 2);
+}
+
+
+
+void debugTSS(float volt, float ntu) {
+  if (!DEBUG_TSS) return;
+  Serial.print(F("[TSS] V="));
+  Serial.print(volt, 3);
+  Serial.print(F(" NTU="));
+  Serial.println(ntu, 1);
+}
+
+
+
+void debugTDS(int med, float vAvg, float vComp, float tdsRaw, float ppm) {
+  if (!DEBUG_TDS) return;
+  Serial.print(F("[TDS] med="));
+  Serial.print(med);
+  Serial.print(F(" Vavg="));
+  Serial.print(vAvg, 3);
+  Serial.print(F(" ppm="));
+  Serial.println(ppm, 0);
+}
+
+
+
+void debugDO(uint16_t raw, float mV, float tempC, float sat, float mgL) {
+  if (!DEBUG_DO) return;
+  Serial.print(F("[DO] raw="));
+  Serial.print(raw);
+  Serial.print(F(" mV="));
+  Serial.print(mV, 0);
+  Serial.print(F(" DO="));
+  Serial.print(mgL, 2);
+  Serial.println(F(" mg/L"));
+}
+
+
+
+// ================== UTILS ==================
+int medianFilter(int *src, int n) {
+  for (int i = 0; i < n; i++) tdsBufTmp[i] = src[i];
+  for (int j = 0; j < n - 1; j++)
+    for (int i = 0; i < n - 1 - j; i++)
+      if (tdsBufTmp[i] > tdsBufTmp[i + 1]) {
+        int t = tdsBufTmp[i];
+        tdsBufTmp[i] = tdsBufTmp[i + 1];
+        tdsBufTmp[i + 1] = t;
+      }
+  if (n & 1) return tdsBufTmp[(n - 1) / 2];
+  return (tdsBufTmp[n / 2] + tdsBufTmp[n / 2 - 1]) / 2;
+}
+
+
+
+float DOsaturationAtTemp(float tC) {
+  struct P {
+    float t;
+    float d;
+  };
+  const P tab[] = { { 0, 14.6 }, { 10, 11.0 }, { 20, 9.1 }, { 25, 8.26 }, { 30, 7.6 } };
+  if (tC <= tab[0].t) return tab[0].d;
+  if (tC >= tab[4].t) return tab[4].d;
+  for (int i = 0; i < 4; i++) {
+    if (tC <= tab[i + 1].t) {
+      float t1 = tab[i].t, d1 = tab[i].d;
+      float t2 = tab[i + 1].t, d2 = tab[i + 1].d;
+      return d1 + (d2 - d1) * (tC - t1) / (t2 - t1);
+    }
+  }
+  return 8.26f;
+}
