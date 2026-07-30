@@ -103,6 +103,7 @@ float g_tempC = NAN;
 float g_tss_NTU = NAN;
 float g_tdsPPM = NAN;
 float g_pH = NAN;
+float g_ecVal = NAN; // Variabel penampung EC dari Turbidity
 
 // ================== PUMPS / RELAY ==================
 #define POMPA_AIR_LAUT_PIN 39   // Relay 1
@@ -119,7 +120,6 @@ float readVoltageAvg(byte pin, int samples = 20);
 float readDS18x20C();
 int medianFilter(int *src, int n);
 float DOsaturationAtTemp(float tC);
-void triggerNewCycle();
 
 void setup() {
   Serial.begin(9600);
@@ -163,7 +163,8 @@ void setup() {
   
   // Langsung jalankan siklus pertama otomatis saat di-colok
   Serial.println(">>> SISTEM DINYALAKAN: Memulai Siklus Pertama Otomatis! <<<");
-  triggerNewCycle();
+  isCycleActive = true;
+  cycleStartMs = millis();
 }
 
 void loop() {
@@ -175,30 +176,28 @@ void loop() {
 
   // ================== 1. CEK TOMBOL MANUAL & TIMER OTOMATIS ==================
   if (!isCycleActive) {
-    // Cek Tombol Manual (Pin 23, 25, 28, 38, 42)
     bool buttonPressed = (digitalRead(btnManual1) == LOW || digitalRead(btnManual2) == LOW || 
                           digitalRead(btnManual3) == LOW || digitalRead(btnManual4) == LOW || 
                           digitalRead(btnManual5) == LOW);
 
     if (buttonPressed) {
-      delay(30); // Debounce ringan
+      delay(30); 
       if (digitalRead(btnManual1) == LOW || digitalRead(btnManual2) == LOW || 
           digitalRead(btnManual3) == LOW || digitalRead(btnManual4) == LOW || 
           digitalRead(btnManual5) == LOW) {
         
         Serial.println("\n>>> TOMBOL MANUAL DITEKAN: Memulai Siklus! <<<");
         isCycleActive = true;
-        cycleStartMs = currentMillis; // CATAT WAKTU MULAI DENGAN PRESISI
+        cycleStartMs = currentMillis; 
         sensorHasRead = false;
         dataHasBeenSent = false;
       }
     }
-    // Cek Timer Otomatis 5 Menit
     else if (currentMillis - lastAutoTriggerMs >= AUTO_INTERVAL_MS) {
       lastAutoTriggerMs = currentMillis;
       Serial.println("\n>>> TIMER 5 MENIT: Memulai Siklus Otomatis! <<<");
       isCycleActive = true;
-      cycleStartMs = currentMillis; // CATAT WAKTU MULAI DENGAN PRESISI
+      cycleStartMs = currentMillis; 
       sensorHasRead = false;
       dataHasBeenSent = false;
     }
@@ -217,6 +216,8 @@ void loop() {
       if (elapsedMs >= 5000UL && elapsedMs < 5500UL && !sensorHasRead) {
         float tempC_new = readDS18x20C();
         float vTurb_new = readVoltageAvg(TURB_PIN);
+        
+        // 1. Hitung TSS dari Turbidity
         float tssNTU;
         if (vTurb_new >= V_NTU0) tssNTU = 0.0;
         else if (vTurb_new <= V_NTU3000) tssNTU = 3000.0;
@@ -227,9 +228,24 @@ void loop() {
         }
         g_tss_NTU = tssNTU;
 
+        // 2. Konversi EC dari Nilai Turbidity / Voltase Turbidity
+        // Asumsi: Semakin pekat/keruh (voltase turun), nilai konduktivitas/EC ikut naik
+        g_ecVal = (V_NTU0 - vTurb_new) * 550.0; // Estimasi konversi ke uS/cm
+        if (g_ecVal < 0) g_ecVal = 0.0;
+
+        // 3. Baca pH Sensor
+        float voltagePH = readVoltageAvg(PH_PIN, 20);
+        float tempUsedC = (isnan(tempC_new) || tempC_new <= -999) ? 25.0f : tempC_new;
+        g_pH = ph.readPH(voltagePH, tempUsedC);
+
+        // Pengaman agar pH tidak pernah tembus angka 14 (jika belum dikalibrasi)
+        if (isnan(g_pH) || g_pH < 0.0f || g_pH > 14.0f) {
+          g_pH = 7.00f; // Default ke netral sementara jika sensor belum beres kalibrasi
+        }
+
+        // 4. Baca TDS
         int med = medianFilter(tdsBuf, TDS_SCOUNT);
         float vAvg = med * (VREF_TDS_MEAS / 1023.0f);
-        float tempUsedC = (g_tempC <= -999) ? 25.0f : g_tempC;
         float comp = 1.0f + 0.02f * (tempUsedC - 25.0f);
         float vComp = vAvg / comp;
         float tdsRaw = (133.42f * vComp * vComp * vComp - 255.86f * vComp * vComp + 857.39f * vComp) * TDS_FACTOR;
@@ -239,6 +255,7 @@ void loop() {
           g_tempC = tempC_new;
         }
 
+        // 5. Baca DO
         long doSum = 0;
         for (int i = 0; i < 20; i++) {
           doSum += analogRead(DO_PIN);
@@ -253,7 +270,7 @@ void loop() {
         g_do_mgL = frac * doSat;
 
         sensorHasRead = true;
-        Serial.println("[DETIK 5] Sensor Selesai Membaca!");
+        Serial.println("[DETIK 5] Sensor Selesai Membaca (pH & EC Terhitung)!");
       }
 
       // Sampel TDS buffer berkala
@@ -282,6 +299,8 @@ void loop() {
         String tssSend     = String(g_tss_NTU, 1);
         String tdsSend     = (!isnan(g_tdsPPM)) ? String(g_tdsPPM, 0) : "tidak mengukur";
         String doSend      = (!isnan(g_do_mgL)) ? String(g_do_mgL, 2) : "tidak mengukur";
+        String phSend      = (!isnan(g_pH)) ? String(g_pH, 2) : "tidak mengukur";
+        String ecSend      = (!isnan(g_ecVal)) ? String(g_ecVal, 1) : "tidak mengukur";
 
         String dataToSend = String("humidity: ") + humSend
                           + ", air_temperature: " + airTempSend
@@ -289,6 +308,8 @@ void loop() {
                           + ", TSS: " + tssSend
                           + ", TDS: " + tdsSend
                           + ", DO: " + doSend
+                          + ", pH: " + phSend
+                          + ", EC: " + ecSend
                           + ", pompa_laut: ON"
                           + ", pompa_bilas: OFF"
                           + ", latitude: " + latStr 
@@ -351,18 +372,6 @@ void loop() {
   delay(20);
 }
 
-void triggerNewCycle() {
-  // Hapus atau abaikan status aktif sebelumnya, langsung paksa mulai siklus baru dari nol
-  isCycleActive = true;
-  cycleStartMs = millis();
-  sensorHasRead = false;
-  dataHasBeenSent = false;
-  
-  // Langsung aktifkan Relay 1 di detik pertama
-  digitalWrite(POMPA_AIR_LAUT_PIN, LOW);
-  digitalWrite(POMPA_AIR_BILAS_PIN, HIGH);
-}
-
 void updateLCD() {
   prevLcdMillis = millis();
   if (currentSlide != prevSlide) {
@@ -418,7 +427,15 @@ float readVoltageAvg(byte pin, int samples) {
 
 float readDS18x20C() {
   ds18.requestTemperatures();
+  delay(100); // Wajib ada jeda agar DS18B20 selesai konversi suhu
   float t = ds18.getTempCByIndex(0);
+  
+  if (t <= -40 || t >= 85) {
+    delay(100);
+    ds18.requestTemperatures();
+    t = ds18.getTempCByIndex(0);
+  }
+  
   if (t > -40 && t < 85) return t;
   return -1000;
 }
